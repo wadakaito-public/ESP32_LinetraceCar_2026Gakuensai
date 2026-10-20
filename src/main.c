@@ -191,6 +191,7 @@ void app_main() {
             ESP_LOGI(__func__, "sensor LOW");
         }
         vTaskDelay(pdMS_TO_TICKS(100));
+        //あとは作るだけ
 
         /*
         set_motorA_state(MOTOR_FORWARD);
