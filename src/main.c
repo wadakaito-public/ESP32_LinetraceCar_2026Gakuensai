@@ -395,11 +395,11 @@ void app_main() {
         update_mode_indicator();
         if (left_motor_stalled) {
             ESP_LOGW(TAG, "LEFT MOTOR STALLED");
-}
+        }
 
-if (right_motor_stalled) {
-    ESP_LOGW(TAG, "RIGHT MOTOR STALLED");
-}
+        if (right_motor_stalled) {
+            ESP_LOGW(TAG, "RIGHT MOTOR STALLED");
+        }
         if(car_state == CAR_RUNNING){
             switch (selected_mode) {
             case 1:
@@ -514,8 +514,8 @@ void update_mode_indicator(void)
     }
 }
 
-#define MODE1_BASE_DUTY 800
-#define MODE1_KP 350
+#define MODE1_BASE_DUTY 750
+#define MODE1_KP 400
 #define MODE1_MIN_DUTY 500
 #define MODE1_RAMP_UP_STEP 30     // 10 msごとに増やすPWM値
 #define MODE1_RAMP_DOWN_STEP 60   // 減速時は少し速く下げる
@@ -542,6 +542,10 @@ static int ramp_duty(int current, int target)
 
     return current;
 }
+
+#define MODE1_SEARCH_TURN_MS 600
+#define MODE1_SEARCH_DUTY 900
+#define MODE1_SEARCH_INNER_DUTY 500
 void run_mode1(
     mcpwm_cmpr_handle_t cmprA,
     mcpwm_cmpr_handle_t cmprB){
@@ -570,83 +574,52 @@ void run_mode1(
     int detected_count = left_detected + center_detected + right_detected+ left_outer_detected+ right_outer_detected;
     //中央からのずれ
     float error;
+    bool recovery_state = false;
+    int recovery_count = 0;
     if (detected_count == 0) {
         //線を検知していない
-        if (last_line_error >= 0.0f) {
-        // 右へ旋回
-        set_motorA_state(MOTOR_FORWARD);
-        set_motorB_state(MOTOR_BACKWARD);
-        set_motor_speed(cmprA, cmprB, 950, 400);
-        } else {
-            // 左へ旋回
-            set_motorA_state(MOTOR_BACKWARD);
-            set_motorB_state(MOTOR_FORWARD);
-            set_motor_speed(cmprA, cmprB, 400, 950);
-        }
-
-        
-        return;
-        /*
         int64_t now_ms = esp_timer_get_time() / 1000;
+        // 線を見失った瞬間の時刻を記録
         if (!searching_line) {
-            // 線を見失った瞬間だけ初期化
-            reset_encoder_stall_monitor();
             searching_line = true;
             search_started_ms = now_ms;
-            if(last_line_error >= 0.0f){
-                //最後に線を検知したのは右or初期状態
-                set_motorA_state(MOTOR_FORWARD);
-                set_motorB_state(MOTOR_BACKWARD);
-                set_motor_speed(cmprA, cmprB, 800, 0);
-            } else{
-                //最後に線を検知したのが左
-                set_motorA_state(MOTOR_BACKWARD);
-                set_motorB_state(MOTOR_FORWARD);
-                set_motor_speed(cmprA, cmprB, 0,800);
-            }
+            reset_encoder_stall_monitor();
+        }
+        if ((left_motor_stalled || right_motor_stalled) && !recovery_state){
+            recovery_state = true;
+            recovery_count = now_ms;
+        }
+        if ((left_motor_stalled || right_motor_stalled) && recovery_state 
+            && now_ms - recovery_count > 800){
+            set_motorA_state(MOTOR_BACKWARD);
+            set_motorB_state(MOTOR_BACKWARD);
+            set_motor_speed(cmprA, cmprB, MODE1_SEARCH_DUTY, MODE1_SEARCH_DUTY);
             return;
-        }
-        int64_t elapsed_ms = now_ms - search_started_ms;
-
-        // 80 ms後に両輪を700で回し始める
-        if (elapsed_ms < 80) {                
-            return;
-        }
-
-        // 先に回していた外側の車輪は、800を維持して少しずつ上げる
-        int outer_duty = 800 + (int)((elapsed_ms - 80) * 1.0f);
-        if (outer_duty > 950) {
-            outer_duty = 950;
-        }
-        // 内側の車輪だけを、0からゆっくり始動させる
-        int inner_duty = (int)((elapsed_ms - 80) * 8.0f);
-        if (inner_duty > 850) {
-            inner_duty = 850;
-        }
-        if (last_line_error >= 0.0f) {
-            // 右探索：左が外側、右が内側
+        } else reset_encoder_stall_monitor();
+        
+        // 最後に線があった側を先に探す
+        bool search_right = (last_line_error >= 0.0f);
+         // 600 msごとに反対側も探す
+        
+        if (search_right) {
+            // 右回転
             set_motorA_state(MOTOR_FORWARD);
             set_motorB_state(MOTOR_BACKWARD);
-            set_motor_speed(cmprA, cmprB, outer_duty, inner_duty);
-
-            update_encoder_stall_monitor(
-                outer_duty >= MODE1_MIN_DUTY,
-                inner_duty >= MODE1_MIN_DUTY
-            );
-        }else {
-        // 左探索：右が外側、左が内側
-        set_motorA_state(MOTOR_BACKWARD);
-        set_motorB_state(MOTOR_FORWARD);
-        set_motor_speed(cmprA, cmprB, inner_duty, outer_duty);
-        
-        update_encoder_stall_monitor(
-            inner_duty >= MODE1_MIN_DUTY,
-            outer_duty >= MODE1_MIN_DUTY
-        );
+            set_motor_speed(cmprA, cmprB, MODE1_SEARCH_DUTY, MODE1_SEARCH_INNER_DUTY);
+        } else {
+            // 左回転
+            set_motorA_state(MOTOR_BACKWARD);
+            set_motorB_state(MOTOR_FORWARD);
+            set_motor_speed(cmprA, cmprB, MODE1_SEARCH_INNER_DUTY, MODE1_SEARCH_DUTY);
         }
+
+        
+        update_encoder_stall_monitor(true, true);
         return;
-        */
     }else if(detected_count > 0){
+        if (searching_line) {
+            reset_encoder_stall_monitor();
+        }
         searching_line = false;
         //線を検知したのでP制御
         //左だけ検出 -> -1.0
