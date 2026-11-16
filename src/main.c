@@ -277,8 +277,7 @@ void run_mode2(
     mcpwm_cmpr_handle_t cmprA,
     mcpwm_cmpr_handle_t cmprB);
 
-static int applied_left_duty = 0;
-static int applied_right_duty = 0;
+
 
 void app_main() {
     //初期化処理
@@ -516,7 +515,8 @@ void update_mode_indicator(void)
 
 #define MODE1_RAMP_UP_STEP 30     // 10 msごとに増やすPWM値
 #define MODE1_RAMP_DOWN_STEP 60   // 減速時は少し速く下げる
-
+static int applied_left_duty = 0;
+static int applied_right_duty = 0;
 static int ramp_duty(int current, int target)
 {
     if (current < target) {
