@@ -50,7 +50,7 @@
 //ボタン長押しの時間
 #define LONG_PRESS_MS 800
 
-#define STALL_TIMEOUT_MS 300
+#define STALL_TIMEOUT_MS 500
 #define RESTART_PAUSE_MS 100
 
 static uint32_t previous_left_pulse = 0;
@@ -165,8 +165,8 @@ static void IRAM_ATTR right_encoder_isr(void *arg)
 {
     right_pulse_count++;
 }
-// センサが黒線を検出したときの値がLOWなら 0、HIGHなら 1。
-#define LINE_DETECTED_LEVEL 1
+// 検出したい線の色の値が白なら 0、黒なら 1。
+#define LINE_DETECTED_LEVEL 0
 
 static led_strip_handle_t led_strip;
 
@@ -537,9 +537,9 @@ static int ramp_duty(int current, int target)
 }
 
 //基礎デューティ比
-#define MODE1_BASE_DUTY 750
+#define MODE1_BASE_DUTY 700
 //比例ゲイン
-#define MODE1_KP 160
+#define MODE1_KP 300
 //最低デューティ比
 #define MODE1_MIN_DUTY 500
 //探索用パラメータ
@@ -555,7 +555,7 @@ static int64_t recovery_started_ms = 0;
 void run_mode1(mcpwm_cmpr_handle_t cmprA,mcpwm_cmpr_handle_t cmprB){
     int right_duty;
     int left_duty;
-
+    
     static float last_line_error = 0.0f;
     
     // 黒線を検出したセンサーを読む
@@ -580,8 +580,26 @@ void run_mode1(mcpwm_cmpr_handle_t cmprA,mcpwm_cmpr_handle_t cmprB){
     int detected_count = left_detected + center_detected + right_detected+ left_outer_detected+ right_outer_detected;
     //中央からのずれ
     float error;
-    
-    if (detected_count == 0) {
+    static int64_t last_sensor_log_ms = 0;
+    int64_t sensor_log_ms = esp_timer_get_time() / 1000;
+
+    if (sensor_log_ms - last_sensor_log_ms >= 200) {
+        last_sensor_log_ms = sensor_log_ms;
+        ESP_LOGI(TAG, "count=%d detected=%d %d %d %d %d",
+             detected_count, left_outer_detected, left_detected,
+             center_detected, right_detected, right_outer_detected);
+    }
+    //検出の連続を数える
+    static int consecutive_detections = 0;
+    if(searching_state && detected_count > 0){
+        consecutive_detections++;
+    }else {
+        consecutive_detections = 0;
+    }
+    bool line_confirmed = detected_count > 0 && (!searching_state||consecutive_detections >= 3);
+    if (!line_confirmed) {
+        led_strip_set_pixel(led_strip, 0, 80, 0, 80);
+        led_strip_refresh(led_strip);
         //線を検知していない
         int64_t now_ms = esp_timer_get_time() / 1000;
         // 線を見失った瞬間の時刻を記録
@@ -597,7 +615,7 @@ void run_mode1(mcpwm_cmpr_handle_t cmprA,mcpwm_cmpr_handle_t cmprB){
             recovery_started_ms = now_ms;
         }
         if (recovery_state){ 
-            if(now_ms - recovery_started_ms < 800){
+            if(now_ms - recovery_started_ms < 1200){
                 //ストール、800㎳後退
                 set_motorA_state(MOTOR_BACKWARD);
                 set_motorB_state(MOTOR_BACKWARD);
@@ -612,15 +630,16 @@ void run_mode1(mcpwm_cmpr_handle_t cmprA,mcpwm_cmpr_handle_t cmprB){
         
         // 最後にラインを検出した側から探索を始める
         bool initial_search_right = (last_line_error >= 0.0f);
-
+        /*
         // 600 msごとに探索方向を反転する
         int64_t elapsed_ms = now_ms - search_started_ms;
         int64_t turn_index = elapsed_ms / MODE1_SEARCH_TURN_MS;
         bool search_right = (turn_index % 2 == 0)
             ? initial_search_right
             : !initial_search_right;
-
-        if (search_right) {
+        */
+        
+        if (initial_search_right) {
             set_motorA_state(MOTOR_FORWARD);
             set_motorB_state(MOTOR_BACKWARD);
             set_motor_speed(cmprA, cmprB, MODE1_SEARCH_DUTY, MODE1_SEARCH_INNER_DUTY);
@@ -632,8 +651,10 @@ void run_mode1(mcpwm_cmpr_handle_t cmprA,mcpwm_cmpr_handle_t cmprB){
         update_encoder_stall_monitor(true, true);
         return;
     
-    }else if(detected_count > 0){
+    } else {
         //線を検出した
+        led_strip_set_pixel(led_strip, 0, 50, 50, 50);
+        led_strip_refresh(led_strip);
         if (searching_state) {
             //直前が探索状態だったなら回転監視をリセット
             reset_encoder_stall_monitor();
@@ -646,8 +667,8 @@ void run_mode1(mcpwm_cmpr_handle_t cmprA,mcpwm_cmpr_handle_t cmprB){
         error = (
             (left_detected ? -1.0f : 0.0f)
             + (right_detected ? 1.0f : 0.0f)
-            + (left_outer_detected ? -1.5f : 0.0f)
-            + (right_outer_detected ? 1.5f : 0.0f)
+            + (left_outer_detected ? -2.5f : 0.0f)
+            + (right_outer_detected ? 2.5f : 0.0f)
         ) / detected_count;
         if (error != 0.0f) {
             last_line_error = error;
