@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <stdlib.h>
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -50,8 +51,8 @@
 //ボタン長押しの時間
 #define LONG_PRESS_MS 800
 
-#define STALL_TIMEOUT_MS 500
-#define RESTART_PAUSE_MS 100
+#define STALL_TIMEOUT_MS 300
+#define RESTART_PAUSE_MS 0
 
 static uint32_t previous_left_pulse = 0;
 static uint32_t previous_right_pulse = 0;
@@ -277,7 +278,8 @@ void run_mode2(
     mcpwm_cmpr_handle_t cmprA,
     mcpwm_cmpr_handle_t cmprB);
 
-
+void bt_log_start(void);
+void bt_log(const char *format, ...);
 
 void app_main() {
     //初期化処理
@@ -389,6 +391,9 @@ void app_main() {
     ESP_LOGI(TAG, "application started");
     led_strip_set_pixel(led_strip,0,100,0,0);
     led_strip_refresh(led_strip);
+
+    bt_log_start();
+
     while (1){
         handle_sw0();
         update_mode_indicator();
@@ -419,6 +424,8 @@ void app_main() {
                 break;
             }
         } else {
+            restart_waiting = false;
+            restart_started_ms = 0;
             set_motorA_state(MOTOR_STOP);
             set_motorB_state(MOTOR_STOP);
         }
@@ -513,8 +520,30 @@ void update_mode_indicator(void)
     }
 }
 
+
+//基礎デューティ比
+#define MODE1_BASE_DUTY 800
+//比例ゲイン
+#define MODE1_KP 300
+//最低デューティ比
+#define MODE1_MIN_DUTY 400
+//探索用パラメータ
+#define MODE1_SEARCH_TURN_MS 1000
+#define MODE1_SEARCH_DUTY 900
+#define MODE1_SEARCH_INNER_DUTY 500
+//内輪を止め始める偏差
+#define MODE1_INNER_STOP_ERROR 1.75f
+//内輪を逆転し始める偏差
+#define MODE1_INNER_REVERSE_ERROR 2.5f
+//逆転時のpwm
+#define MODE1_INNER_REVERSE_DUTY 800
+//逆転時の1周期当たりPWM増加量
+#define MODE1_REVERSE_RAMP_STEP 250
 #define MODE1_RAMP_UP_STEP 30     // 10 msごとに増やすPWM値
 #define MODE1_RAMP_DOWN_STEP 60   // 減速時は少し速く下げる
+//再始動用の定数
+#define RESTART_KICK_MS 300
+#define RESTART_KICK_DUTY 1000
 static int applied_left_duty = 0;
 static int applied_right_duty = 0;
 static int ramp_duty(int current, int target)
@@ -535,17 +564,47 @@ static int ramp_duty(int current, int target)
 
     return current;
 }
+//モータ駆動方向＆量設定
+static void apply_mode1_drive(
+    mcpwm_cmpr_handle_t cmprA, mcpwm_cmpr_handle_t cmprB,
+    int left, int right)
+{
+    if ((applied_left_duty > 0 && left < 0) ||
+        (applied_left_duty < 0 && left > 0)) {
+        left = 0;
+    }
+    if ((applied_right_duty > 0 && right < 0) ||
+        (applied_right_duty < 0 && right > 0)) {
+        right = 0;
+    }
 
-//基礎デューティ比
-#define MODE1_BASE_DUTY 700
-//比例ゲイン
-#define MODE1_KP 300
-//最低デューティ比
-#define MODE1_MIN_DUTY 500
-//探索用パラメータ
-#define MODE1_SEARCH_TURN_MS 600
-#define MODE1_SEARCH_DUTY 900
-#define MODE1_SEARCH_INNER_DUTY 500
+    set_motorA_state(left > 0 ? MOTOR_FORWARD : left < 0 ? MOTOR_BACKWARD : MOTOR_STOP);
+    set_motorB_state(right > 0 ? MOTOR_FORWARD : right < 0 ? MOTOR_BACKWARD : MOTOR_STOP);
+    set_motor_speed(cmprA, cmprB, abs(left), abs(right));
+
+    applied_left_duty = left;
+    applied_right_duty = right;
+}
+//符号あり
+static int ramp_signed_duty(int current, int target)
+{
+    if (target == 0) {
+        return 0;
+    }
+    if (target > 0) {
+        return ramp_duty(current > 0 ? current : 0, target);
+    }
+
+    int magnitude = current < 0 ? -current : 0;//今の逆転の大きさ
+    int target_magnitude = -target;//目標の大きさ
+
+    if (magnitude < target_magnitude) {
+        magnitude += MODE1_REVERSE_RAMP_STEP;
+        return magnitude < target_magnitude ? -magnitude : target;
+    }
+
+    return -ramp_duty(magnitude, target_magnitude);
+}
 static bool searching_state = false;
 static int64_t search_started_ms = 0;
 
@@ -557,7 +616,65 @@ void run_mode1(mcpwm_cmpr_handle_t cmprA,mcpwm_cmpr_handle_t cmprB){
     int left_duty;
     
     static float last_line_error = 0.0f;
-    
+    static bool restart_drive_sent = false;
+    static bool restart_left_wheel = false;
+    static int64_t restart_kick_started_ms = 0;
+    static uint32_t restart_outer_pulse_start = 0;
+    bool restart_finished = false;
+
+    if (restart_waiting) {
+        int64_t now_ms = esp_timer_get_time() / 1000;
+
+        int64_t kick_elapsed_ms = now_ms - restart_kick_started_ms;
+        bool center_on_line =
+            gpio_get_level(sensor_Photoreflector_center) == LINE_DETECTED_LEVEL;
+
+        // 最初の100 msは駆動を維持する。
+        // その後は中央でラインを検出するか、最大時間に達したら終了。
+        if (kick_elapsed_ms < 100 ||
+            (kick_elapsed_ms < RESTART_KICK_MS && !center_on_line)) {
+            return;
+        }
+
+        if (!restart_drive_sent) {
+            uint32_t left_start = left_pulse_count;
+            uint32_t right_start = right_pulse_count;
+            restart_outer_pulse_start =
+                restart_left_wheel ? left_start : right_start;
+
+            apply_mode1_drive(
+                cmprA, cmprB,
+                restart_left_wheel ? RESTART_KICK_DUTY : 500,
+                restart_left_wheel ? 500 : RESTART_KICK_DUTY);
+
+            restart_kick_started_ms = esp_timer_get_time() / 1000;
+            restart_drive_sent = true;
+            reset_encoder_stall_monitor();
+
+            bt_log("BLUE t=%lld pwm L=%d R=%d enc L=%lu R=%lu\r\n",
+                   (long long)restart_kick_started_ms,
+                   applied_left_duty, applied_right_duty,
+                   (unsigned long)left_start, (unsigned long)right_start);
+            led_strip_set_pixel(led_strip, 0, 0, 0, 100);
+            led_strip_refresh(led_strip);
+            return;
+        }
+
+        if (now_ms - restart_kick_started_ms < RESTART_KICK_MS) {
+            return;
+        }
+
+        uint32_t outer_pulse_now =
+            restart_left_wheel ? left_pulse_count : right_pulse_count;
+
+        bt_log("KICK_END t=%lld wheel=%c delta=%lu\r\n",
+               (long long)now_ms, restart_left_wheel ? 'L' : 'R',
+               (unsigned long)(outer_pulse_now - restart_outer_pulse_start));
+
+        restart_waiting = false;
+        restart_finished = true;
+        restart_started_ms = 0;
+    }
     // 黒線を検出したセンサーを読む
     bool left_detected =
         gpio_get_level(sensor_Photoreflector_left_inner)
@@ -597,9 +714,36 @@ void run_mode1(mcpwm_cmpr_handle_t cmprA,mcpwm_cmpr_handle_t cmprB){
         consecutive_detections = 0;
     }
     bool line_confirmed = detected_count > 0 && (!searching_state||consecutive_detections >= 3);
+
+    //未検出の連続を数える
+    static int consecutive_misses = 0;
+    if (!searching_state && !restart_waiting && !restart_finished && detected_count == 0 &&
+        (applied_left_duty != 0 || applied_right_duty != 0) &&
+        consecutive_misses < 5) {
+        consecutive_misses++;
+        return;  // 直前のモータ指令を維持する
+    }
+    consecutive_misses = 0;
+
+    int64_t led_now_ms = esp_timer_get_time() / 1000;
+
+    if (restart_started_ms > 0 && led_now_ms - restart_started_ms < 1000) {
+        if(restart_drive_sent){
+            led_strip_set_pixel(led_strip, 0, 0, 0, 100);  // 青：タイヤ再始動
+        } else {
+            led_strip_set_pixel(led_strip, 0, 100, 0, 0);  // 赤：ストールでPWMを0にした
+        }
+    } else if (!line_confirmed && recovery_state &&
+               led_now_ms - recovery_started_ms < 500) {
+        led_strip_set_pixel(led_strip, 0, 100, 100, 0 );//オレンジ：後退
+    } else if (line_confirmed) {
+        led_strip_set_pixel(led_strip, 0, 50, 50, 50);  // 白：P制御
+    } else {
+        led_strip_set_pixel(led_strip, 0, 80, 0, 80);   // 紫：探索
+    }
+    led_strip_refresh(led_strip);
+    
     if (!line_confirmed) {
-        led_strip_set_pixel(led_strip, 0, 80, 0, 80);
-        led_strip_refresh(led_strip);
         //線を検知していない
         int64_t now_ms = esp_timer_get_time() / 1000;
         // 線を見失った瞬間の時刻を記録
@@ -609,25 +753,41 @@ void run_mode1(mcpwm_cmpr_handle_t cmprA,mcpwm_cmpr_handle_t cmprB){
             search_started_ms = now_ms;
             reset_encoder_stall_monitor();
         }
-        if ((left_motor_stalled || right_motor_stalled) && !recovery_state){
-            //どちらかのモータがストール(止まっている)
+        if ((left_motor_stalled || right_motor_stalled) && !recovery_state) {
             recovery_state = true;
             recovery_started_ms = now_ms;
         }
-        if (recovery_state){ 
-            if(now_ms - recovery_started_ms < 1200){
-                //ストール、800㎳後退
-                set_motorA_state(MOTOR_BACKWARD);
-                set_motorB_state(MOTOR_BACKWARD);
-                set_motor_speed(cmprA, cmprB, MODE1_SEARCH_DUTY, MODE1_SEARCH_DUTY);
-                update_encoder_stall_monitor(true,true);
+
+        if (recovery_state) {
+            int64_t recovery_elapsed_ms = now_ms - recovery_started_ms;
+
+            // 最初の500 msは後退
+            if (recovery_elapsed_ms < 500) {
+                apply_mode1_drive(
+                    cmprA, cmprB,
+                    -MODE1_SEARCH_DUTY, -MODE1_SEARCH_DUTY);
+
+                update_encoder_stall_monitor(true, true);
                 return;
             }
-        //上のifを抜け、この行に到達(returnしていない)→800ms経過
-        recovery_state = false;
-        reset_encoder_stall_monitor();
+
+            // 後退後の200 msは両輪前進で旋回し、探索を立ち上げる
+            if (recovery_elapsed_ms < 700) {
+                bool turn_right = last_line_error >= 0.0f;
+
+                apply_mode1_drive(
+                    cmprA, cmprB,
+                    turn_right ? 1000 : 00,
+                    turn_right ? 0 : 1000);
+
+                return;
+            }
+
+            // 通常探索へ戻る時点からストール監視を再開
+            recovery_state = false;
+            reset_encoder_stall_monitor();
         }
-        
+
         // 最後にラインを検出した側から探索を始める
         bool initial_search_right = (last_line_error >= 0.0f);
         /*
@@ -640,21 +800,15 @@ void run_mode1(mcpwm_cmpr_handle_t cmprA,mcpwm_cmpr_handle_t cmprB){
         */
         
         if (initial_search_right) {
-            set_motorA_state(MOTOR_FORWARD);
-            set_motorB_state(MOTOR_BACKWARD);
-            set_motor_speed(cmprA, cmprB, MODE1_SEARCH_DUTY, MODE1_SEARCH_INNER_DUTY);
+            apply_mode1_drive(cmprA, cmprB, MODE1_SEARCH_DUTY, -MODE1_SEARCH_INNER_DUTY);
         } else {
-            set_motorA_state(MOTOR_BACKWARD);
-            set_motorB_state(MOTOR_FORWARD);
-            set_motor_speed(cmprA, cmprB, MODE1_SEARCH_INNER_DUTY, MODE1_SEARCH_DUTY);
+            apply_mode1_drive(cmprA, cmprB, -MODE1_SEARCH_INNER_DUTY, MODE1_SEARCH_DUTY);
         }
-        update_encoder_stall_monitor(true, true);
+        update_encoder_stall_monitor(initial_search_right, !initial_search_right);
         return;
     
     } else {
         //線を検出した
-        led_strip_set_pixel(led_strip, 0, 50, 50, 50);
-        led_strip_refresh(led_strip);
         if (searching_state) {
             //直前が探索状態だったなら回転監視をリセット
             reset_encoder_stall_monitor();
@@ -678,44 +832,56 @@ void run_mode1(mcpwm_cmpr_handle_t cmprA,mcpwm_cmpr_handle_t cmprB){
         //補正値を追加
         left_duty = MODE1_BASE_DUTY + correction;
         right_duty = MODE1_BASE_DUTY - correction;
-
+        //上下限適用
         if (left_duty < MODE1_MIN_DUTY)left_duty = MODE1_MIN_DUTY;
         if(right_duty < MODE1_MIN_DUTY)right_duty = MODE1_MIN_DUTY; 
         if (left_duty > PERIOD_TICKS) left_duty = PERIOD_TICKS;
-        if (right_duty > PERIOD_TICKS) right_duty = PERIOD_TICKS; 
+        if (right_duty > PERIOD_TICKS) right_duty = PERIOD_TICKS;
+        //停止、逆転適用
+        float abs_error = error < 0.0f ? -error : error;//絶対値を求める
+        if (abs_error >=MODE1_INNER_STOP_ERROR) {
+            int inner_duty = 0;
+            if (abs_error >= MODE1_INNER_REVERSE_ERROR) {
+                inner_duty = -MODE1_INNER_REVERSE_DUTY;
+            }
+            if(error > 0.0f) {
+                right_duty = inner_duty;
+            } else {
+                left_duty = inner_duty;
+            }
+        }
 
         int64_t now_ms = esp_timer_get_time() / 1000;
         // 片輪でも止まったら、一度PWMを0にして再始動準備
-        if ((left_motor_stalled || right_motor_stalled) && !restart_waiting) {
-            applied_left_duty = 0;
-            applied_right_duty = 0;
+        if (left_motor_stalled || right_motor_stalled) {
             restart_waiting = true;
             restart_started_ms = now_ms;
+            restart_drive_sent = false;
+            restart_left_wheel = last_line_error > 0.0f;
 
+            bt_log("RED t=%lld stall L=%d R=%d pwm L=%d R=%d enc L=%lu R=%lu\r\n",
+                   (long long)now_ms, left_motor_stalled, right_motor_stalled,
+                   applied_left_duty, applied_right_duty,
+                   (unsigned long)left_pulse_count,
+                   (unsigned long)right_pulse_count);
+
+            apply_mode1_drive(cmprA, cmprB, 0, 0);
             reset_encoder_stall_monitor();
-
-            set_motorA_state(MOTOR_FORWARD);
-            set_motorB_state(MOTOR_FORWARD);
-            set_motor_speed(cmprA, cmprB, 0, 0);
+            led_strip_set_pixel(led_strip, 0, 100, 0, 0);
+            led_strip_refresh(led_strip);
             return;
         }
-        // 100 msだけ無通電にしてから、通常の段階加速へ戻る
-        if (restart_waiting) {
-            if (now_ms - restart_started_ms < RESTART_PAUSE_MS) {
-                return;
-              }
-            restart_waiting = false;
-        }
-        // 目標PWMへ段階的に近づける
-        applied_left_duty = ramp_duty(applied_left_duty, left_duty);
-        applied_right_duty = ramp_duty(applied_right_duty, right_duty);
-        set_motorA_state(MOTOR_FORWARD);
-        set_motorB_state(MOTOR_FORWARD);
-        set_motor_speed(cmprA, cmprB, applied_left_duty, applied_right_duty);
-        update_encoder_stall_monitor(applied_left_duty >= MODE1_MIN_DUTY,applied_right_duty >= MODE1_MIN_DUTY);
-    }
 
+        int next_left = ramp_signed_duty(applied_left_duty, left_duty);
+        int next_right = ramp_signed_duty(applied_right_duty, right_duty);
+        apply_mode1_drive(cmprA, cmprB, next_left, next_right);
+
+        update_encoder_stall_monitor(
+            abs(applied_left_duty) >= MODE1_MIN_DUTY,
+            abs(applied_right_duty) >= MODE1_MIN_DUTY);
+    }
 }
+
 static bool last_line_was_left = true;
 void run_mode2(
     mcpwm_cmpr_handle_t cmprA,
@@ -733,34 +899,31 @@ void run_mode2(
 
     if (line_detected) {
         // 線を検出中：前進
-        set_motor_speed(cmprA, cmprB, 500, 500);
+        set_motor_speed(cmprA, cmprB, 650, 650);
 
     } else if (line_detected_left) {
         //左センサで線を検出
         //右に曲がる
         set_motorA_state(MOTOR_STOP);
-        set_motor_speed(cmprA, cmprB, 500, 500);
+        set_motor_speed(cmprA, cmprB, 0, 700);
         last_line_was_left = true;
 
     } else if(line_detected_right){
         //右センサで線を検出
         //左に曲がる
         set_motorB_state(MOTOR_STOP);
-        set_motor_speed(cmprA,cmprB,500,500);
+        set_motor_speed(cmprA,cmprB,700,0);
         last_line_was_left = false;
     }else {
         //線を見失った
         searching_state = true;
         search_started_ms = esp_timer_get_time()/1000;
         if(last_line_was_left){
-            
-            set_motorB_state(MOTOR_BACKWARD);
-            set_motor_speed(cmprA, cmprB, 800, 500);
-            
-        }else {
             set_motorA_state(MOTOR_BACKWARD);
-            set_motor_speed(cmprA, cmprB, 500, 800);
-            
+            set_motor_speed(cmprA, cmprB, 700, 800);
+        }else {
+            set_motorB_state(MOTOR_BACKWARD);
+            set_motor_speed(cmprA, cmprB, 800, 700);
         }
     }
 }
@@ -782,13 +945,13 @@ void update_encoder_stall_monitor(
     }
 
     // 左のパルスが増えた = 左車輪は回転中
-    if (left_pulse_count != previous_left_pulse) {
+    if (!left_should_rotate || left_pulse_count != previous_left_pulse) {
         previous_left_pulse = left_pulse_count;
         last_left_rotation_ms = now_ms;
     }
 
     // 右のパルスが増えた = 右車輪は回転中
-    if (right_pulse_count != previous_right_pulse) {
+    if (!right_should_rotate || right_pulse_count != previous_right_pulse) {
         previous_right_pulse = right_pulse_count;
         last_right_rotation_ms = now_ms;
     }
