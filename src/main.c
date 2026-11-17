@@ -11,14 +11,14 @@
 //出力ピン指定
 //TB6612出力側指定
 //MotorA(左)
-#define PWM_A 27
-#define MotorA_IN1 12
-#define MotorA_IN2 14
+#define PWM_A 27//実装基板では33
+#define MotorA_IN1 12//実装基板では26
+#define MotorA_IN2 14//実装基板では25
 //MotorB(右)
-#define MotorB_IN1 26
-#define MotorB_IN2 25
-#define PWM_B 33
-#define STBY 13 //両モータ共通
+#define MotorB_IN1 26//実装基板では14
+#define MotorB_IN2 25//実装基板では12
+#define PWM_B 33//実装基板では13
+#define STBY 13 //両モータ共通//実装基板では27
 
 #define LED 2 //esp32 onboard LED
 #define LED_STRIP_GPIO 16 //freenove ESP32 wroom onboard fullcolorLED
@@ -733,28 +733,33 @@ void run_mode2(
 
     if (line_detected) {
         // 線を検出中：前進
-        set_motor_speed(cmprA, cmprB, 700, 700);
+        set_motor_speed(cmprA, cmprB, 500, 500);
 
     } else if (line_detected_left) {
         //左センサで線を検出
         //右に曲がる
-        set_motor_speed(cmprA, cmprB, 500, 900);
+        set_motorA_state(MOTOR_STOP);
+        set_motor_speed(cmprA, cmprB, 500, 500);
         last_line_was_left = true;
 
     } else if(line_detected_right){
         //右センサで線を検出
         //左に曲がる
-        set_motor_speed(cmprA,cmprB,900,500);
+        set_motorB_state(MOTOR_STOP);
+        set_motor_speed(cmprA,cmprB,500,500);
         last_line_was_left = false;
     }else {
         //線を見失った
         searching_state = true;
         search_started_ms = esp_timer_get_time()/1000;
         if(last_line_was_left){
-            set_motor_speed(cmprA, cmprB, 800, 0);
+            
+            set_motorB_state(MOTOR_BACKWARD);
+            set_motor_speed(cmprA, cmprB, 800, 500);
             
         }else {
-            set_motor_speed(cmprA, cmprB, 0, 800);
+            set_motorA_state(MOTOR_BACKWARD);
+            set_motor_speed(cmprA, cmprB, 500, 800);
             
         }
     }
