@@ -719,7 +719,7 @@ void run_mode1(mcpwm_cmpr_handle_t cmprA,mcpwm_cmpr_handle_t cmprB){
     static int consecutive_misses = 0;
     if (!searching_state && !restart_waiting && !restart_finished && detected_count == 0 &&
         (applied_left_duty != 0 || applied_right_duty != 0) &&
-        consecutive_misses < 5) {
+        consecutive_misses < 10) {
         consecutive_misses++;
         return;  // 直前のモータ指令を維持する
     }
