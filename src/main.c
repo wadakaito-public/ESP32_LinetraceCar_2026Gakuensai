@@ -883,6 +883,12 @@ void run_mode1(mcpwm_cmpr_handle_t cmprA,mcpwm_cmpr_handle_t cmprB){
 }
 
 static bool last_line_was_left = true;
+static bool mode2_searching = false;
+static int64_t mode2_search_started_ms = 0;
+#define MODE2_SEARCH_INNER_MS       100
+#define MODE2_SEARCH_REVERSE_MS     50
+#define MODE2_SEARCH_OUTER_DUTY     900
+#define MODE2_SEARCH_INNER_DUTY     1000
 void run_mode2(
     mcpwm_cmpr_handle_t cmprA,
     mcpwm_cmpr_handle_t cmprB)
@@ -890,44 +896,70 @@ void run_mode2(
     int center = gpio_get_level(sensor_Photoreflector_center);
     int left_inner = gpio_get_level(sensor_Photoreflector_left_inner);
     int right_inner = gpio_get_level(sensor_Photoreflector_right_inner);
-    bool line_detected = (center == LINE_DETECTED_LEVEL);
-    bool line_detected_left = (left_inner == LINE_DETECTED_LEVEL);
-    bool line_detected_right = (right_inner == LINE_DETECTED_LEVEL);
+
+    bool line_detected =
+        center == LINE_DETECTED_LEVEL;
+    bool line_detected_left =
+        left_inner == LINE_DETECTED_LEVEL;
+    bool line_detected_right =
+        right_inner == LINE_DETECTED_LEVEL;
+    bool any_line_detected =
+        line_detected || line_detected_left || line_detected_right;
+
+    int64_t now_ms = esp_timer_get_time() / 1000;
+
+    // 見失ったら探索を開始。探索時間中はセンサ反応を無視する
+    if (mode2_searching || !any_line_detected) {
+        if (!mode2_searching) {
+            mode2_searching = true;
+            mode2_search_started_ms = now_ms;
+        }
+
+        int64_t elapsed_ms = now_ms - mode2_search_started_ms;
+
+        if (elapsed_ms < MODE2_SEARCH_INNER_MS + MODE2_SEARCH_REVERSE_MS) {
+            bool drive_outer = elapsed_ms >= MODE2_SEARCH_INNER_MS;
+            motor_state outer_state = drive_outer ? MOTOR_FORWARD : MOTOR_STOP;
+            uint32_t outer_duty = drive_outer ? MODE2_SEARCH_OUTER_DUTY : 0;
+
+            if (last_line_was_left) {
+                set_motorA_state(MOTOR_BACKWARD);
+                set_motorB_state(outer_state);
+                set_motor_speed(
+                    cmprA, cmprB, MODE2_SEARCH_INNER_DUTY, outer_duty);
+            } else {
+                set_motorA_state(outer_state);
+                set_motorB_state(MOTOR_BACKWARD);
+                set_motor_speed(
+                    cmprA, cmprB, outer_duty, MODE2_SEARCH_INNER_DUTY);
+            }
+
+            return;
+        }
+
+        // 指定時間が終わったら、次の行からセンサ判定に戻る
+        mode2_searching = false;
+    }
 
     set_motorA_state(MOTOR_FORWARD);
     set_motorB_state(MOTOR_FORWARD);
 
     if (line_detected) {
-        // 線を検出中：前進
-        set_motor_speed(cmprA, cmprB, 650, 650);
+        set_motor_speed(cmprA, cmprB, 600, 600);
 
     } else if (line_detected_left) {
-        //左センサで線を検出
-        //右に曲がる
+        // 左センサで検出：左へ曲がる
         set_motorA_state(MOTOR_STOP);
-        set_motor_speed(cmprA, cmprB, 0, 700);
+        set_motor_speed(cmprA, cmprB, 0, 950);
         last_line_was_left = true;
 
-    } else if(line_detected_right){
-        //右センサで線を検出
-        //左に曲がる
+    } else if (line_detected_right) {
+        // 右センサで検出：右へ曲がる
         set_motorB_state(MOTOR_STOP);
-        set_motor_speed(cmprA,cmprB,700,0);
+        set_motor_speed(cmprA, cmprB, 950, 0);
         last_line_was_left = false;
-    }else {
-        //線を見失った
-        searching_state = true;
-        search_started_ms = esp_timer_get_time()/1000;
-        if(last_line_was_left){
-            set_motorA_state(MOTOR_BACKWARD);
-            set_motor_speed(cmprA, cmprB, 700, 800);
-        }else {
-            set_motorB_state(MOTOR_BACKWARD);
-            set_motor_speed(cmprA, cmprB, 800, 700);
-        }
     }
 }
-
 void update_encoder_stall_monitor(
     bool left_should_rotate,
     bool right_should_rotate)
