@@ -528,9 +528,10 @@ void update_mode_indicator(void)
 //最低デューティ比
 #define MODE1_MIN_DUTY 400
 //探索用パラメータ
-#define MODE1_SEARCH_TURN_MS 1000
-#define MODE1_SEARCH_DUTY 900
-#define MODE1_SEARCH_INNER_DUTY 500
+#define MODE1_SEARCH_TURN_MS 700
+#define MODE1_SEARCH_DUTY 1000
+#define MODE1_SEARCH_INNER_DUTY 1000
+#define MODE1_SEARCH_BACK_DUTY 900
 //内輪を止め始める偏差
 #define MODE1_INNER_STOP_ERROR 1.75f
 //内輪を逆転し始める偏差
@@ -629,9 +630,9 @@ void run_mode1(mcpwm_cmpr_handle_t cmprA,mcpwm_cmpr_handle_t cmprB){
         bool center_on_line =
             gpio_get_level(sensor_Photoreflector_center) == LINE_DETECTED_LEVEL;
 
-        // 最初の100 msは駆動を維持する。
+        // 最初の150 msは駆動を維持する。
         // その後は中央でラインを検出するか、最大時間に達したら終了。
-        if (kick_elapsed_ms < 100 ||
+        if (kick_elapsed_ms <150 ||
             (kick_elapsed_ms < RESTART_KICK_MS && !center_on_line)) {
             return;
         }
@@ -657,10 +658,6 @@ void run_mode1(mcpwm_cmpr_handle_t cmprA,mcpwm_cmpr_handle_t cmprB){
                    (unsigned long)left_start, (unsigned long)right_start);
             led_strip_set_pixel(led_strip, 0, 0, 0, 100);
             led_strip_refresh(led_strip);
-            return;
-        }
-
-        if (now_ms - restart_kick_started_ms < RESTART_KICK_MS) {
             return;
         }
 
@@ -758,19 +755,24 @@ void run_mode1(mcpwm_cmpr_handle_t cmprA,mcpwm_cmpr_handle_t cmprB){
             recovery_started_ms = now_ms;
         }
 
+        //最低でも探索を続ける時間
+        if(searching_state && now_ms - search_started_ms > MODE1_SEARCH_TURN_MS){
+            return;
+        }
+
         if (recovery_state) {
             int64_t recovery_elapsed_ms = now_ms - recovery_started_ms;
 
-            // 最初の500 msは後退
-            if (recovery_elapsed_ms < 500) {
+            // 最初の800 msは後退
+            if (recovery_elapsed_ms < 800) {
                 apply_mode1_drive(
                     cmprA, cmprB,
-                    -MODE1_SEARCH_DUTY, -MODE1_SEARCH_DUTY);
+                    -MODE1_SEARCH_BACK_DUTY, -MODE1_SEARCH_BACK_DUTY);
 
                 update_encoder_stall_monitor(true, true);
                 return;
             }
-
+            /*
             // 後退後の200 msは両輪前進で旋回し、探索を立ち上げる
             if (recovery_elapsed_ms < 700) {
                 bool turn_right = last_line_error >= 0.0f;
@@ -782,7 +784,7 @@ void run_mode1(mcpwm_cmpr_handle_t cmprA,mcpwm_cmpr_handle_t cmprB){
 
                 return;
             }
-
+            */
             // 通常探索へ戻る時点からストール監視を再開
             recovery_state = false;
             reset_encoder_stall_monitor();
