@@ -277,6 +277,41 @@ static struct {
 
 static void reset_trial_controller(int mode);
 
+enum { TRACK_ACTIVE = 1, TRACK_CENTER = 2, TRACK_LEFT_OUTER = 4, TRACK_RIGHT_OUTER = 8 };
+static struct tracking_stats {
+    unsigned flags;
+    int64_t sample_ms, total_ms, center_ms, outer_ms;
+    int64_t left_streak_ms, right_streak_ms, longest_outer_ms;
+} tracking;
+
+// Attribute each elapsed interval to the preceding sensor sample.
+static void trial_tracking_sample(int64_t now_ms, unsigned flags)
+{
+    const unsigned previous = tracking.flags;
+    const int64_t elapsed = now_ms - tracking.sample_ms;
+    if (previous & TRACK_ACTIVE) tracking.total_ms += elapsed;
+    if (previous & TRACK_CENTER) tracking.center_ms += elapsed;
+    if (previous & (TRACK_LEFT_OUTER | TRACK_RIGHT_OUTER)) tracking.outer_ms += elapsed;
+
+    if (previous & TRACK_LEFT_OUTER) tracking.left_streak_ms += elapsed;
+    if (previous & TRACK_RIGHT_OUTER) tracking.right_streak_ms += elapsed;
+    if (tracking.left_streak_ms > tracking.longest_outer_ms)
+        tracking.longest_outer_ms = tracking.left_streak_ms;
+    if (tracking.right_streak_ms > tracking.longest_outer_ms)
+        tracking.longest_outer_ms = tracking.right_streak_ms;
+    if (!(flags & TRACK_LEFT_OUTER)) tracking.left_streak_ms = 0;
+    if (!(flags & TRACK_RIGHT_OUTER)) tracking.right_streak_ms = 0;
+    tracking.flags = flags;
+    tracking.sample_ms = now_ms;
+}
+
+static unsigned tracking_flags(bool center, bool left_outer, bool right_outer)
+{
+    if (center) return TRACK_ACTIVE | TRACK_CENTER;
+    return TRACK_ACTIVE | (left_outer ? TRACK_LEFT_OUTER : 0)
+                        | (right_outer ? TRACK_RIGHT_OUTER : 0);
+}
+
 // 走行開始時に制御状態と計測値を初期化し、現在のパルス数を監視の基準にする。
 static void trial_begin(int mode, int64_t now_ms)
 {
@@ -284,6 +319,7 @@ static void trial_begin(int mode, int64_t now_ms)
     if (!trial.active) return;
 
     reset_trial_controller(mode);
+    tracking = (struct tracking_stats){ .sample_ms = now_ms };
     ++run_id;
     trial.mode = mode;
     trial.started_ms = now_ms;
@@ -300,6 +336,7 @@ static void trial_begin(int mode, int64_t now_ms)
 // 探索に入った周期に1回だけ呼ぶ。探索中の後退も同じ探索区間に含める。
 static void trial_search_begin(int64_t now_ms)
 {
+    trial_tracking_sample(now_ms, 0);
     trial.searching = true;
     trial.search_started_ms = now_ms;
     trial.search_count++;
@@ -327,6 +364,7 @@ static void stop_car(const char *reason, int64_t now_ms)
     }
     trial_search_end(now_ms);
     trial.active = false;
+    trial_tracking_sample(now_ms, 0);
     RUN_LOG("RUN id=%lu fw=" FW_VERSION " mode=%d control=%s stop_reason=%s",
             run_id, trial.mode, trial.mode == 1 ? "v3.6.0" : "v2.0.0", reason);
     RUN_LOG("TIME id=%lu run_ms=%lld search_count=%lu search_ms=%lld",
@@ -335,6 +373,9 @@ static void stop_car(const char *reason, int64_t now_ms)
     RUN_LOG("STALL id=%lu stall_count=%lu stall_backoff=%lu stall_restart=%lu",
             run_id, (unsigned long)(trial.stall_backoff + trial.stall_restart),
             (unsigned long)trial.stall_backoff, (unsigned long)trial.stall_restart);
+    RUN_LOG("TRACK id=%lu track_ms=%lld center_ms=%lld outer_ms=%lld outer_max_ms=%lld",
+            run_id, (long long)tracking.total_ms, (long long)tracking.center_ms,
+            (long long)tracking.outer_ms, (long long)tracking.longest_outer_ms);
 }
 
 // 左右いずれかのパルスが変化すると無回転時間を数え直す。両輪が5秒間変化しないと停止する。
@@ -681,6 +722,7 @@ void run_mode1(mcpwm_cmpr_handle_t cmprA,mcpwm_cmpr_handle_t cmprB){
         (applied_left_duty != 0 || applied_right_duty != 0) &&
         consecutive_misses < 10) {
         consecutive_misses++;
+        trial_tracking_sample(esp_timer_get_time() / 1000, TRACK_ACTIVE);
         return;  // 直前のモータ指令を維持する
     }
     consecutive_misses = 0;
@@ -823,6 +865,7 @@ void run_mode1(mcpwm_cmpr_handle_t cmprA,mcpwm_cmpr_handle_t cmprB){
         // 片輪でも止まったら、一度PWMを0にして再始動準備
         if (left_motor_stalled || right_motor_stalled) {
             restart_waiting = true;
+            trial_tracking_sample(now_ms, 0);
             trial.stall_restart++;
             restart_started_ms = now_ms;
             restart_drive_sent = false;
@@ -842,6 +885,8 @@ void run_mode1(mcpwm_cmpr_handle_t cmprA,mcpwm_cmpr_handle_t cmprB){
         }
 
         int next_left = ramp_signed_duty(applied_left_duty, left_duty);
+        trial_tracking_sample(esp_timer_get_time() / 1000,
+            tracking_flags(center_detected, left_outer_detected, right_outer_detected));
         int next_right = ramp_signed_duty(applied_right_duty, right_duty);
         apply_mode1_drive(cmprA, cmprB, next_left, next_right);
 
@@ -1176,6 +1221,7 @@ void run_mode3(mcpwm_cmpr_handle_t cmprA,mcpwm_cmpr_handle_t cmprB){
             legacy_applied_left_duty = 0;
             legacy_applied_right_duty = 0;
             legacy_restart_waiting = true;
+            trial_tracking_sample(now_ms, 0);
             trial.stall_restart++;
             legacy_restart_started_ms = now_ms;
 
@@ -1195,6 +1241,8 @@ void run_mode3(mcpwm_cmpr_handle_t cmprA,mcpwm_cmpr_handle_t cmprB){
         }
         // 目標PWMへ段階的に近づける
         legacy_applied_left_duty = legacy_ramp_duty(legacy_applied_left_duty, left_duty);
+        trial_tracking_sample(esp_timer_get_time() / 1000,
+            tracking_flags(center_detected, left_outer_detected, right_outer_detected));
         legacy_applied_right_duty = legacy_ramp_duty(legacy_applied_right_duty, right_duty);
         set_motorA_state(MOTOR_FORWARD);
         set_motorB_state(MOTOR_FORWARD);
@@ -1247,6 +1295,42 @@ static void reset_trial_controller(int mode)
 }
 
 /* 起動処理と走行ループ */
+// C1の立ち上がり回数をUSBシリアルだけに出力する。停止中は手回しで分解能を測れる。
+#define ENCODER_LOG_INTERVAL_MS 500
+static void log_encoder_sample(void)
+{
+    static bool initialized;
+    static int64_t previous_ms;
+    static uint32_t previous_left, previous_right;
+    static car_state_t previous_state;
+    static int previous_mode;
+
+    const int64_t now_ms = esp_timer_get_time() / 1000;
+    const bool new_interval = !initialized || car_state != previous_state ||
+                              selected_mode != previous_mode;
+    const int64_t elapsed_ms = now_ms - previous_ms;
+    if (!new_interval && elapsed_ms < ENCODER_LOG_INTERVAL_MS) return;
+
+    const uint32_t left = left_pulse_count;
+    const uint32_t right = right_pulse_count;
+    const char *state = car_state == CAR_RUNNING ? "running" :
+                        car_state == CAR_STOPPED ? "stopped" : "select";
+
+    // 状態・モード切替時には基準値を出し、前の状態の回転を差分から除く。
+    ESP_LOGI(TAG, "ENC t=%lld state=%s mode=%d dt_ms=%lld L=%lu R=%lu dL=%lu dR=%lu",
+             (long long)now_ms, state, selected_mode,
+             (long long)(new_interval ? 0 : elapsed_ms),
+             (unsigned long)left, (unsigned long)right,
+             (unsigned long)(new_interval ? 0 : (uint32_t)(left - previous_left)),
+             (unsigned long)(new_interval ? 0 : (uint32_t)(right - previous_right)));
+    initialized = true;
+    previous_ms = now_ms;
+    previous_left = left;
+    previous_right = right;
+    previous_state = car_state;
+    previous_mode = selected_mode;
+}
+
 void app_main() {
     //初期化処理
     ESP_LOGD(TAG, "initialize GPIO");
@@ -1364,6 +1448,7 @@ void app_main() {
     while (1){
         handle_sw0();
         trial_check_wheel_motion();
+        log_encoder_sample();
         update_mode_indicator();
         if(car_state == CAR_RUNNING){
             switch (selected_mode) {
